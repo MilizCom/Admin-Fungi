@@ -1,15 +1,14 @@
 import 'dart:convert';
 
 class Product {
-  final int? id;
+  final String? id; // <--- UBAH KE STRING (Wajib untuk Firestore)
   final String name;
-  final int price; // Harga Tampilan (misal harga terendah)
+  final int price;
   final String imagePath;
   final String category;
   final String subCategory;
   int quantity;
 
-  // LOGIKA BARU: Map Kode -> Harga (Contoh: {'H': 15000, 'L': 22000})
   Map<String, int> variantPrices;
 
   Product({
@@ -23,38 +22,55 @@ class Product {
     this.variantPrices = const {},
   });
 
-  // Helper: Cek apakah punya varian
   bool get hasVariant => variantPrices.isNotEmpty;
 
   factory Product.fromMap(Map<String, dynamic> map) {
-    // Decode JSON String dari database ke Map Dart
     Map<String, int> parsedVariants = {};
-    if (map['variant_data'] != null &&
-        map['variant_data'].toString().isNotEmpty) {
-      try {
-        Map<String, dynamic> decoded = jsonDecode(map['variant_data']);
-        decoded.forEach((key, value) {
-          parsedVariants[key] = value as int;
-        });
-      } catch (e) {
-        print("Error parsing variants: $e");
+
+    // --- PERBAIKAN LOGIKA PARSING VARIAN ---
+    // Firestore bisa menyimpan data sebagai MAP langsung, tidak selalu JSON String.
+    // Jadi kita cek tipenya dulu.
+    var rawData = map['variant_data'];
+
+    if (rawData != null) {
+      // KASUS 1: Data berupa String JSON (Sisa dari SQLite)
+      if (rawData is String && rawData.isNotEmpty) {
+        try {
+          Map<String, dynamic> decoded = jsonDecode(rawData);
+          decoded.forEach((key, value) {
+            parsedVariants[key] = (value as num).toInt();
+          });
+        } catch (e) {
+          print("Error parsing variant JSON: $e");
+        }
+      }
+      // KASUS 2: Data berupa MAP (Format Native Firestore)
+      else if (rawData is Map) {
+        try {
+          rawData.forEach((key, value) {
+            parsedVariants[key.toString()] = (value as num).toInt();
+          });
+        } catch (e) {
+          print("Error parsing variant Map: $e");
+        }
       }
     }
 
     return Product(
-      id: map['id'],
-      name: map['name'],
-      price: map['price'],
-      imagePath: map['imagePath'],
-      category: map['category'],
-      subCategory: map['subCategory'],
-      quantity: map['quantity'],
+      // Konversi ID ke String dengan aman
+      id: map['id']?.toString(),
+      name: map['name'] ?? '',
+      price: (map['price'] as num?)?.toInt() ?? 0,
+      imagePath: map['imagePath'] ?? '',
+      category: map['category'] ?? 'Umum',
+      subCategory: map['subCategory'] ?? 'Umum',
+      quantity: (map['quantity'] as num?)?.toInt() ?? 0,
       variantPrices: parsedVariants,
     );
   }
 }
 
-// Model Kategori (Hanya untuk Tampilan UI, tidak masuk DB)
+// Model Kategori (Tidak berubah)
 class SubCategory {
   final String name;
   final List<Product> products;

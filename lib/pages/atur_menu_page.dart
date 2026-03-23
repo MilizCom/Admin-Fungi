@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
+// import 'package:fungi_casheer/service/firestore_seeder.dart';
 import 'package:get/get.dart';
 import '../controllers/kasir_controller.dart';
 import '../models/menu_model.dart';
@@ -18,6 +19,33 @@ class AturMenuPage extends StatelessWidget {
         backgroundColor: Colors.green,
         foregroundColor: Colors.white,
         elevation: 0,
+        actions: [
+          // === TOMBOL RESET & UPLOAD SEEDER (BARU) ===
+          IconButton(
+            icon: const Icon(Icons.cloud_upload),
+            tooltip: "Isi Data Awal (Reset)",
+            onPressed: () {
+              Get.defaultDialog(
+                title: "Isi Data Menu?",
+                middleText: "Database akan diisi dengan menu bawaan Fungi.",
+                textConfirm: "Ya, Isi Sekarang",
+                textCancel: "Batal",
+                confirmTextColor: Colors.white,
+                buttonColor: Colors.green,
+                onConfirm: () async {
+                  Get.back(); // Tutup dialog
+                  // await FirestoreSeeder.seedProducts();
+
+                  // 2. Refresh tampilan controller
+                  controller.loadData();
+
+                  Get.snackbar("Sukses", "Data Menu Berhasil Diupload!");
+                },
+              );
+            },
+          ),
+          // ===========================================
+        ],
       ),
       floatingActionButton: FloatingActionButton.extended(
         backgroundColor: Colors.green,
@@ -250,10 +278,10 @@ class AturMenuPage extends StatelessWidget {
                     // GAMBAR
                     Obx(
                       () => GestureDetector(
-                        onTap: () async {
-                          String? p = await controller.pickImage();
-                          if (p != null) imagePath.value = p;
-                        },
+                        // onTap: () async {
+                        //   String? p = await controller.pickImage();
+                        //   if (p != null) imagePath.value = p;
+                        // },
                         child: Container(
                           height: 80,
                           width: 80,

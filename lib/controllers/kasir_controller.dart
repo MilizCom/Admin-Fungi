@@ -1,250 +1,443 @@
 import 'package:flutter/material.dart';
+import 'package:fungi_casheer/data/FirestoreHelper.dart';
+// import 'package:fungi_casheer/service/firestore_seeder.dart';
 import 'package:get/get.dart';
-import 'package:image_picker/image_picker.dart';
-import '../data/db_helper.dart';
+// Pastikan import ini sesuai dengan struktur folder Anda
 import '../models/menu_model.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
 
 class KasirController extends GetxController {
-  // === 1. VARIABEL STATE ===
+  // ===========================================================================
+  // 1. STATE VARIABLES
+  // ===========================================================================
+
+  // Data Menu & Kategori
   var menuData = <MenuCategory>[].obs;
   var isLoading = true.obs;
-  var tableTierList = <Map<String, dynamic>>[].obs;
-  var isSyncing = false.obs; // Untuk loading indicator
+  var isSyncing = false.obs;
+
+  // Input Kasir
+  final TextEditingController tableController = TextEditingController();
+  final TextEditingController nameController = TextEditingController();
+
+  // Keranjang Belanja
+  var cartItems = <Map<String, dynamic>>[].obs;
+
+  // Filter & Search Menu
   var selectedCategoryIndex = 0.obs;
   var selectedSubCategoryIndex = 0.obs;
   var searchText = ''.obs;
 
-  var activeTransactions =
-      <Map<String, dynamic>>[].obs; // List Pesanan Berjalan
-  final TextEditingController tableController =
-      TextEditingController(); // Kontroller Input Meja
-  var cartItems = <Map<String, dynamic>>[].obs;
-  final TextEditingController nameController =
-      TextEditingController(); // [BARU]
+  // List Bill Gantung (Pending Orders)
+  var activeTransactions = <Map<String, dynamic>>[].obs;
 
+  // ===========================================================================
+  // 2. INITIALIZATION
+  // ===========================================================================
   @override
   void onInit() {
     super.onInit();
-    loadData();
-    loadActiveTransactions();
+    _initData();
   }
 
+  Future<void> _initData() async {
+    try {
+      // await FirestoreSeeder.seedProducts();
+      loadData();
+      loadActiveTransactions();
+    } catch (e) {
+      showNotif("Error", "$e", isError: true);
+    }
+  }
+
+  // ===========================================================================
+  // 3. LOAD DATA
+  // ===========================================================================
+
+  /// Mengambil data produk dari Firebase dan mengelompokkannya
+  void loadData() async {
+    isLoading.value = true;
+    try {
+      final List<Product> rawProducts = await FirestoreHelper.instance
+          .getAllProducts();
+
+      // Logika Grouping (Kategori -> Sub -> Produk)
+      Map<String, Map<String, List<Product>>> grouped = {};
+      for (var p in rawProducts) {
+        if (cartItems.isEmpty)
+          p.quantity = 0; // Reset counter UI jika cart kosong
+
+        if (!grouped.containsKey(p.category)) grouped[p.category] = {};
+        if (!grouped[p.category]!.containsKey(p.subCategory)) {
+          grouped[p.category]![p.subCategory] = [];
+        }
+        grouped[p.category]![p.subCategory]!.add(p);
+      }
+
+      List<MenuCategory> tempData = [];
+      grouped.forEach((catName, subMap) {
+        List<SubCategory> tempSubs = [];
+        subMap.forEach(
+          (subName, pList) =>
+              tempSubs.add(SubCategory(name: subName, products: pList)),
+        );
+        tempData.add(MenuCategory(name: catName, subCategories: tempSubs));
+      });
+
+      menuData.value = tempData;
+    } catch (e) {
+      showNotif("Error", "Gagal memuat menu: $e", isError: true);
+    } finally {
+      isLoading.value = false;
+    }
+  }
+
+  /// Mengambil daftar Bill Gantung (Running Orders)
+  void loadActiveTransactions() async {
+    try {
+      activeTransactions.value = await FirestoreHelper.instance
+          .getActiveTransactions();
+    } catch (e) {
+      print("Error load active trx: $e");
+    }
+  }
+
+  /// Mengambil detail item dari sebuah transaksi
   Future<List<Map<String, dynamic>>> getOrderDetails(
     String transactionId,
   ) async {
-    return await DatabaseHelper.instance.getTransactionItems(transactionId);
+    return await FirestoreHelper.instance.getTransactionItems(transactionId);
   }
 
-  // 3. FUNGSI BARU: LANJUTKAN ORDER (AUTO FILL)
-  void resumeOrder(String table, String name) {
-    tableController.text = table; // Isi otomatis No Meja
-    nameController.text = name; // Isi otomatis Nama
-    Get.back(); // Kembali ke halaman Kasir
+  // ===========================================================================
+  // 4. TRANSACTION LOGIC (PENDING VS PAID)
+  // ===========================================================================
+
+  /// FITUR 1: SIMPAN BILL (PENDING)
+  /// Data masuk Firebase tapi statusnya 'Open'. Tidak muncul di Laporan.
+  Future<void> saveAsPending() async {
+    if (cartItems.isEmpty) {
+      showNotif("Gagal", "Keranjang kosong!", isError: true);
+      return;
+    }
+    if (tableController.text.trim().isEmpty) {
+      showNotif(
+        "Gagal",
+        "Nomor Meja wajib diisi untuk Bill Gantung!",
+        isError: true,
+      );
+      return;
+    }
+
+    await processTransaction(
+      paymentMethod: "PENDING",
+      isRunningOrder: true, // TRUE = Masuk Bill Gantung
+      orderType: "Dine In", // Default Dine In kalau pending
+    );
   }
 
-  void loadActiveTransactions() async {
-    activeTransactions.value = await DatabaseHelper.instance
-        .getActiveTransactions();
+  /// FITUR 2: BAYAR LANGSUNG (LUNAS)
+  /// Data masuk Firebase status 'Paid'. Langsung muncul di Laporan.
+  Future<void> payNow(String method, String type) async {
+    if (cartItems.isEmpty) {
+      showNotif("Gagal", "Keranjang kosong!", isError: true);
+      return;
+    }
+    await processTransaction(
+      paymentMethod: method, // Tunai / QRIS
+      isRunningOrder: false, // FALSE = Langsung Lunas
+      orderType: type,
+    );
   }
 
+  /// FITUR 3: MELUNASI BILL GANTUNG
+  /// Mengubah status transaksi dari 'Open' ke 'Paid'.
+  /// Data pindah dari Active Order ke Laporan.
+  Future<void> payRunningOrder(String transactionId, String method) async {
+    try {
+      isLoading.value = true;
+      // Update di Firestore: is_running_order jadi 0, status jadi Paid
+      await FirestoreHelper.instance.checkoutOpenBill(transactionId, method);
+
+      loadActiveTransactions(); // Refresh agar hilang dari list active
+
+      Get.back(); // Tutup dialog bayar jika ada
+      showNotif("Lunas", "Bill berhasil dibayar dan masuk Laporan.");
+    } catch (e) {
+      showNotif("Error", "Gagal bayar: $e", isError: true);
+    } finally {
+      isLoading.value = false;
+    }
+  }
+
+  /// FUNGSI INTERNAL: Proses Simpan ke Firestore
+  /// FUNGSI UTAMA PROSES TRANSAKSI
   Future<void> processTransaction({
-    required String customerName,
-    required String tableNumber,
-    required String orderType,
+    // <--- HAPUS garis bawah
     required String paymentMethod,
     required bool isRunningOrder,
+    required String orderType,
+    // Tambahkan parameter optional jika UI Anda mengirimkannya manual
+    String? customerName,
+    String? tableNumber,
   }) async {
-    if (cartItems.isEmpty) return;
-
     try {
-      await DatabaseHelper.instance.saveOrder(
+      isLoading.value = true;
+
+      // Gunakan data dari parameter JIKA ADA, kalau tidak ambil dari Controller Text
+      String custName =
+          customerName ??
+          (nameController.text.isEmpty ? "Pelanggan" : nameController.text);
+      String tableNum =
+          tableNumber ??
+          (tableController.text.isEmpty ? "-" : tableController.text);
+
+      await FirestoreHelper.instance.saveOrder(
         cartItems: cartItems,
-        customerName: customerName,
-        tableNumber: tableNumber,
+        customerName: custName,
+        tableNumber: tableNum,
         orderType: orderType,
         paymentMethod: paymentMethod,
         isRunningOrder: isRunningOrder,
       );
 
-      await resetAll();
-      tableController.clear();
-      nameController.clear();
-      loadActiveTransactions();
+      await resetAll(); // Bersihkan keranjang UI
+      loadActiveTransactions(); // Refresh List Bill Gantung
 
-      // TIDAK ADA NOTIFIKASI SUKSES
+      String msg = isRunningOrder
+          ? "Bill disimpan (Pending)"
+          : "Pembayaran Berhasil!";
+      showNotif("Sukses", msg);
+
+      if (!isRunningOrder) Get.closeAllSnackbars();
     } catch (e) {
-      print(
-        "Error processTransaction: $e",
-      ); // Ganti notif error jadi print console
-    }
-  }
-
-  Future<void> payRunningOrder(String transactionId, String method) async {
-    // 1. Update Database
-    await DatabaseHelper.instance.checkoutOpenBill(transactionId, method);
-
-    // 2. Refresh List
-    loadActiveTransactions();
-
-    // Note: Error dilempar otomatis ke UI (catch block di widget)
-  }
-
-  // === 3. SYNC FIREBASE (LOGIKA FIX) ===
-  Future<void> syncDataToFirebase() async {
-    try {
-      isSyncing.value = true;
-      final firestore = FirebaseFirestore.instance;
-      int successCount = 0;
-      int cancelCount = 0;
-
-      // ===========================================
-      // BAGIAN 1: UPLOAD TRANSAKSI SUKSES
-      // ===========================================
-      final List<Map<String, dynamic>> unsyncedRows = await DatabaseHelper
-          .instance
-          .getUnsyncedTransactions();
-
-      if (unsyncedRows.isNotEmpty) {
-        // Grouping Data
-        Map<String, List<Map<String, dynamic>>> grouped = {};
-        for (var row in unsyncedRows) {
-          String trId = row['transaction_id'];
-          if (!grouped.containsKey(trId)) grouped[trId] = [];
-          grouped[trId]!.add(row);
-        }
-
-        for (String trId in grouped.keys) {
-          List<Map<String, dynamic>> items = grouped[trId]!;
-          var header = items.first;
-
-          Map<String, dynamic> strukData = {
-            'transaction_id': trId,
-            'customer_name': header['customer_name'],
-            'table_number': header['table_number'],
-            'payment_method': header['payment_method'],
-            'order_type': header['order_type'],
-            'transaction_date': header['transaction_date'],
-            'total_bill': items.fold(
-              0,
-              (sum, item) => sum + (item['total_price'] as int),
-            ),
-            'items': items
-                .map(
-                  (item) => {
-                    'product_name': item['product_name'],
-                    'qty': item['qty'],
-                    'variant': item['variant'] ?? '-',
-                    'price': item['product_price'],
-                    'discount': item['discount'] ?? 0,
-                    'total': item['total_price'],
-                  },
-                )
-                .toList(),
-            'uploaded_at': FieldValue.serverTimestamp(),
-          };
-
-          // Upload ke koleksi 'transaksi'
-          await firestore.collection('transaksi').doc(trId).set(strukData);
-          await DatabaseHelper.instance.markTransactionAsSynced(trId);
-          successCount++;
-        }
-      }
-
-      // ===========================================
-      // BAGIAN 2: UPLOAD DATA PEMBATALAN (VOID)
-      // ===========================================
-      final List<Map<String, dynamic>> unsyncedCancels = await DatabaseHelper
-          .instance
-          .getUnsyncedCancellations();
-
-      if (unsyncedCancels.isNotEmpty) {
-        for (var row in unsyncedCancels) {
-          // Upload ke koleksi 'pembatalan'
-          await firestore.collection('pembatalan').add({
-            'transaction_id': row['transaction_id'],
-            'product_name': row['product_name'],
-            'qty': row['qty'],
-            'total_lost': row['total_lost'],
-            'reason': row['reason'],
-            'cancel_date': row['cancel_date'],
-            'uploaded_at': FieldValue.serverTimestamp(),
-          });
-
-          // Tandai synced di lokal
-          await DatabaseHelper.instance.markCancellationAsSynced(row['id']);
-          cancelCount++;
-        }
-      }
-
-      // ===========================================
-      // FEEDBACK USER
-      // ===========================================
-      if (successCount == 0 && cancelCount == 0) {
-        showNotif("Info", "Semua data (Transaksi & Void) sudah terkirim.");
-      } else {
-        showNotif(
-          "Sync Selesai",
-          "Berhasil upload: $successCount Transaksi, $cancelCount Void.",
-        );
-      }
-    } catch (e) {
-      showNotif("Gagal Kirim", "Cek internet. Error: $e", isError: true);
-      print(e);
+      showNotif("Gagal", "Error transaksi: $e", isError: true);
     } finally {
-      isSyncing.value = false;
+      isLoading.value = false;
     }
   }
+  // ===========================================================================
+  // 5. VOID / PEMBATALAN
+  // ===========================================================================
 
+  /// Membatalkan (Menghapus) seluruh Bill Gantung
   Future<void> voidRunningOrder(String transactionId, String reason) async {
     try {
-      await DatabaseHelper.instance.cancelTransaction(transactionId, reason);
-
-      // Refresh list agar pesanan hilang dari layar
+      await FirestoreHelper.instance.cancelTransaction(transactionId, reason);
       loadActiveTransactions();
-
-      Get.back(); // Tutup Dialog
+      Get.back(); // Tutup dialog
+      showNotif("Void Sukses", "Transaksi dibatalkan permanen.", isError: true);
     } catch (e) {
-      showNotif("Error", "Gagal membatalkan: $e", isError: true);
+      showNotif("Error", "Gagal void: $e", isError: true);
     }
   }
 
-  void showNotif(String title, String message, {bool isError = false}) {
-    Get.snackbar(
-      title,
-      message,
-      snackPosition: SnackPosition.TOP,
-      maxWidth: 300,
-      margin: const EdgeInsets.all(10),
-      backgroundColor: isError
-          ? Colors.red.withOpacity(0.9)
-          : Colors.green.withOpacity(0.9),
-      colorText: Colors.white,
-      borderRadius: 12,
-      icon: Icon(
-        isError ? Icons.error_outline : Icons.check_circle_outline,
-        color: Colors.white,
-      ),
-      duration: const Duration(seconds: 2),
+  /// Menghapus SATU ITEM dari Bill yang sudah tersimpan
+  Future<void> deleteHistoryItem(
+    String docId,
+    Map<String, dynamic> item,
+    String reason,
+  ) async {
+    try {
+      isLoading.value = true;
+      // Panggil Helper dengan 3 Parameter
+      await FirestoreHelper.instance.moveOrderToCancellation(
+        docId,
+        item,
+        reason,
+      );
+      showNotif("Sukses", "Item dihapus dari transaksi.");
+
+      // Opsional: Jika Anda memanggil ini dari ActiveOrderPage, refresh listnya
+      // loadActiveTransactions();
+    } catch (e) {
+      showNotif("Error", "Gagal hapus item: $e", isError: true);
+    } finally {
+      isLoading.value = false;
+    }
+  }
+
+  // ===========================================================================
+  // 6. CART LOGIC (KERANJANG)
+  // ===========================================================================
+
+  void addToCart(Product product, String variant, int priceUsed) {
+    int index = cartItems.indexWhere(
+      (item) => item['product'].id == product.id && item['variant'] == variant,
     );
+
+    if (index != -1) {
+      var currentItem = cartItems[index];
+      currentItem['qty'] = currentItem['qty'] + 1;
+      cartItems[index] = currentItem;
+    } else {
+      cartItems.add({
+        'product': product,
+        'qty': 1,
+        'variant': variant,
+        'price_used': priceUsed,
+        'discount': 0,
+      });
+    }
+    product.quantity++;
+    menuData.refresh();
+  }
+
+  void removeFromCart(Product product) {
+    int index = cartItems.lastIndexWhere(
+      (item) => item['product'].id == product.id,
+    );
+
+    if (index != -1) {
+      var item = cartItems[index];
+      if (item['qty'] > 1) {
+        item['qty'] = item['qty'] - 1;
+        cartItems[index] = item;
+      } else {
+        cartItems.removeAt(index);
+      }
+
+      if (product.quantity > 0) product.quantity--;
+      menuData.refresh();
+    }
+  }
+
+  void updateItemDiscount(int index, int discountAmount) {
+    var item = cartItems[index];
+    int price = item['price_used'] ?? item['product'].price;
+
+    if (discountAmount > price) {
+      showNotif("Gagal", "Diskon melebihi harga!", isError: true);
+      return;
+    }
+    item['discount'] = discountAmount;
+    cartItems[index] = item;
+    cartItems.refresh();
+    Get.back();
+    showNotif("Sukses", "Diskon diterapkan.");
   }
 
   int get totalPrice {
     int total = 0;
     for (var item in cartItems) {
-      Product p = item['product'];
-      int finalPrice = item['price_used'] ?? p.price;
+      int price = item['price_used'];
       int qty = item['qty'];
-      int discount = item['discount'] ?? 0; // Ambil nilai diskon
-
-      // Rumus: (Harga - Diskon) * Jumlah
-      int totalPerItem = (finalPrice - discount) * qty;
-      total += totalPerItem;
+      int discount = item['discount'] ?? 0;
+      total += (price - discount) * qty;
     }
     return total;
   }
 
-  // Logika Menampilkan Produk (Search vs Filter Kategori)
+  /// Reset UI (Batalkan input sebelum disimpan)
+  void cancelOrder(String reason) {
+    print("Reset UI. Alasan: $reason");
+    resetAll();
+    showNotif("Info", "Input direset", isError: true);
+  }
+
+  Future<void> resetAll() async {
+    cartItems.clear();
+    tableController.clear();
+    nameController.clear();
+    for (var cat in menuData) {
+      for (var sub in cat.subCategories) {
+        for (var p in sub.products) p.quantity = 0;
+      }
+    }
+    menuData.refresh();
+  }
+
+  // ===========================================================================
+  // 7. PRODUCT MANAGEMENT (CRUD)
+  // ===========================================================================
+
+  Future<void> addProduct(
+    String name,
+    String basePrice,
+    String cat,
+    String sub,
+    String imgPath,
+    Map<String, int> variants,
+  ) async {
+    try {
+      int price = int.tryParse(basePrice) ?? 0;
+      Product newProduct = Product(
+        name: name,
+        price: price,
+        imagePath: imgPath.isEmpty ? 'assets/images/nasi.png' : imgPath,
+        category: cat,
+        subCategory: sub,
+        variantPrices: variants,
+      );
+      await FirestoreHelper.instance.insertProduct(newProduct);
+      loadData();
+      Get.back();
+      showNotif("Sukses", "Menu ditambah");
+    } catch (e) {
+      showNotif("Error", "$e", isError: true);
+    }
+  }
+
+  Future<void> editProduct(
+    String docId,
+    String name,
+    String basePrice,
+    String cat,
+    String sub,
+    String imgPath,
+    Map<String, int> variants,
+  ) async {
+    try {
+      int price = int.tryParse(basePrice) ?? 0;
+      Product updated = Product(
+        name: name,
+        price: price,
+        imagePath: imgPath,
+        category: cat,
+        subCategory: sub,
+        variantPrices: variants,
+      );
+      await FirestoreHelper.instance.updateProduct(updated, docId);
+      loadData();
+      Get.back();
+      showNotif("Sukses", "Menu diupdate");
+    } catch (e) {
+      showNotif("Error", "$e", isError: true);
+    }
+  }
+
+  Future<void> deleteProduct(String docId) async {
+    try {
+      await FirestoreHelper.instance.deleteProduct(docId);
+      loadData();
+      showNotif("Info", "Menu dihapus", isError: true);
+    } catch (e) {
+      showNotif("Error", "$e", isError: true);
+    }
+  }
+
+  // Future<String?> pickImage() async {
+  //   final ImagePicker picker = ImagePicker();
+  //   final XFile? image = await picker.pickImage(source: ImageSource.gallery);
+  //   return image?.path;
+  // }
+
+  // ===========================================================================
+  // 8. UI HELPERS
+  // ===========================================================================
+
+  /// Mengambil data dari Bill Gantung untuk ditambahkan menu baru
+  void resumeOrder(String table, String name) {
+    tableController.text = table;
+    nameController.text = name;
+    Get.back(); // Tutup halaman active order
+    Get.snackbar("Lanjut Order", "Silakan tambah menu untuk Meja $table");
+  }
+
+  void changeCategory(int i) {
+    selectedCategoryIndex.value = i;
+    selectedSubCategoryIndex.value = 0;
+  }
+
   List<Product> get displayedProducts {
     if (searchText.value.isNotEmpty) {
       List<Product> results = [];
@@ -268,244 +461,35 @@ class KasirController extends GetxController {
     return currentCat.subCategories[selectedSubCategoryIndex.value].products;
   }
 
-  void loadData() async {
-    isLoading.value = true;
-    final List<Product> rawProducts = await DatabaseHelper.instance
-        .getAllProducts();
-    // Logic grouping sama kayak v7/v8...
-    Map<String, Map<String, List<Product>>> grouped = {};
-    for (var p in rawProducts) {
-      if (cartItems.isEmpty) p.quantity = 0;
-      if (!grouped.containsKey(p.category)) grouped[p.category] = {};
-      if (!grouped[p.category]!.containsKey(p.subCategory))
-        grouped[p.category]![p.subCategory] = [];
-      grouped[p.category]![p.subCategory]!.add(p);
-    }
-    List<MenuCategory> tempData = [];
-    grouped.forEach((catName, subMap) {
-      List<SubCategory> tempSubs = [];
-      subMap.forEach(
-        (subName, pList) =>
-            tempSubs.add(SubCategory(name: subName, products: pList)),
-      );
-      tempData.add(MenuCategory(name: catName, subCategories: tempSubs));
-    });
-    menuData.value = tempData;
-    isLoading.value = false;
-  }
+  List<String> getExistingCategories() =>
+      menuData.map((e) => e.name).toSet().toList();
 
-  void changeCategory(int i) {
-    selectedCategoryIndex.value = i;
-    selectedSubCategoryIndex.value = 0;
-  }
-
-  // === 5. CART LOGIC ===
-  void addToCart(Product product, String variant, int priceUsed) {
-    int index = cartItems.indexWhere(
-      (item) => item['product'].id == product.id && item['variant'] == variant,
-    );
-
-    if (index != -1) {
-      var currentItem = cartItems[index];
-      currentItem['qty'] = currentItem['qty'] + 1;
-      cartItems[index] = currentItem;
-    } else {
-      cartItems.add({
-        'product': product,
-        'qty': 1,
-        'variant': variant,
-        'price_used': priceUsed,
-        'discount': 0, // <--- PENTING: Default Diskon 0
-      });
-    }
-    product.quantity++;
-    menuData.refresh();
-  }
-
-  void updateItemDiscount(int index, int discountAmount) {
-    var item = cartItems[index];
-    int price = item['price_used'] ?? item['product'].price;
-
-    // Validasi: Diskon tidak boleh lebih besar dari harga
-    if (discountAmount > price) {
-      showNotif("Gagal", "Diskon melebihi harga produk!", isError: true);
-      return;
-    }
-
-    item['discount'] = discountAmount;
-    cartItems[index] = item;
-
-    cartItems.refresh(); // Update UI Total Harga
-    Get.back(); // Tutup Dialog
-    showNotif("Sukses", "Diskon diterapkan.");
-  }
-
-  void removeFromCart(Product product) {
-    int index = cartItems.lastIndexWhere(
-      (item) => item['product'].id == product.id,
-    );
-    if (index != -1) {
-      var item = cartItems[index];
-      if (item['qty'] > 1) {
-        item['qty'] = item['qty'] - 1;
-        cartItems[index] = item;
-      } else {
-        cartItems.removeAt(index);
-      }
-      if (product.quantity > 0) product.quantity--;
-      menuData.refresh();
-    }
-  }
-
-  Future<void> resetAll() async {
-    cartItems.clear();
-
-    // BERSIHKAN INPUT TEKS JUGA
-    tableController.clear();
-    nameController.clear();
-
-    // Reset qty di menu
-    for (var cat in menuData) {
-      for (var sub in cat.subCategories) {
-        for (var p in sub.products) {
-          p.quantity = 0;
-        }
-      }
-    }
-    menuData.refresh();
-  }
-
-  Future<void> processPayment(
-    String name,
-    String table,
-    String orderType,
-    String paymentMethod,
-  ) async {
-    await DatabaseHelper.instance.saveTransaction(
-      cartItems,
-      name,
-      table,
-      orderType,
-      paymentMethod,
-    );
-    await resetAll();
-    // NOTIFIKASI BARU
-    showNotif("Sukses", "Transaksi Berhasil Disimpan");
-  }
-
-  Future<void> cancelOrder(String reason) async {
-    await DatabaseHelper.instance.saveCancellation(cartItems, reason);
-    await resetAll();
-    // NOTIFIKASI BARU
-    showNotif("Info", "Transaksi Dibatalkan", isError: true);
-  }
-
-  Future<void> deleteHistoryItem(
-    int id,
-    Map<String, dynamic> item,
-    String reason,
-  ) async {
-    try {
-      await DatabaseHelper.instance.moveOrderToCancel(id, item, reason);
-      await loadStatistics();
-      Get.back();
-      // NOTIFIKASI BARU
-      showNotif("Sukses", "Data dipindah ke Batal");
-    } catch (e) {
-      showNotif("Error", "Gagal menghapus: $e", isError: true);
-    }
-  }
-
-  Future<void> addProduct(
-    String name,
-    String basePrice,
-    String category,
-    String sub,
-    String imagePath,
-    Map<String, int> variantPrices,
-  ) async {
-    try {
-      int priceInt = int.tryParse(basePrice) ?? 0;
-      Product newProduct = Product(
-        name: name,
-        price: priceInt, // Harga dasar (Tampilan)
-        imagePath: imagePath.isEmpty ? 'assets/images/nasi.png' : imagePath,
-        category: category,
-        subCategory: sub,
-        variantPrices: variantPrices, // Simpan Map Harga Varian
-      );
-
-      await DatabaseHelper.instance.insertProduct(newProduct);
-      loadData();
-      Get.back();
-      showNotif("Sukses", "Menu berhasil ditambah");
-    } catch (e) {
-      showNotif("Error", "Gagal: $e", isError: true);
-    }
-  }
-
-  Future<void> editProduct(
-    int id,
-    String name,
-    String basePrice,
-    String category,
-    String sub,
-    String imagePath,
-    Map<String, int> variantPrices,
-  ) async {
-    try {
-      int priceInt = int.tryParse(basePrice) ?? 0;
-      Product updatedProduct = Product(
-        id: id,
-        name: name,
-        price: priceInt,
-        imagePath: imagePath,
-        category: category,
-        subCategory: sub,
-        variantPrices: variantPrices,
-      );
-
-      await DatabaseHelper.instance.updateProduct(updatedProduct);
-      loadData();
-      Get.back();
-      showNotif("Sukses", "Menu berhasil diupdate");
-    } catch (e) {
-      showNotif("Error", "Gagal: $e", isError: true);
-    }
-  }
-
-  Future<void> deleteProduct(int id) async {
-    await DatabaseHelper.instance.deleteProduct(id);
-    loadData();
-    // NOTIFIKASI BARU
-    showNotif("Info", "Menu dihapus", isError: true);
-  }
-
-  Future<String?> pickImage() async {
-    final ImagePicker picker = ImagePicker();
-    final XFile? image = await picker.pickImage(source: ImageSource.gallery);
-    return image?.path;
-  }
-
-  Future<void> loadStatistics() async {
-    final tiers = await DatabaseHelper.instance.getTableTierList();
-    tableTierList.value = tiers;
-  }
-
-  List<String> getExistingCategories() {
-    return menuData.map((e) => e.name).toSet().toList(); // toSet agar unik
-  }
-
-  // Ambil Sub-Kategori berdasarkan Kategori yang dipilih
   List<String> getExistingSubCategories(String categoryName) {
-    // Cari kategori yang namanya cocok
     var category = menuData.firstWhereOrNull(
       (e) => e.name.toLowerCase() == categoryName.toLowerCase(),
     );
-
-    if (category != null) {
+    if (category != null)
       return category.subCategories.map((e) => e.name).toSet().toList();
-    }
-    return []; // Return kosong jika kategori baru/tidak ditemukan
+    return [];
+  }
+
+  void showNotif(String title, String message, {bool isError = false}) {
+    Get.snackbar(
+      title,
+      message,
+      snackPosition: SnackPosition.TOP,
+      maxWidth: 300,
+      margin: const EdgeInsets.all(10),
+      backgroundColor: isError
+          ? Colors.red.withOpacity(0.9)
+          : Colors.green.withOpacity(0.9),
+      colorText: Colors.white,
+      borderRadius: 12,
+      icon: Icon(
+        isError ? Icons.error_outline : Icons.check_circle_outline,
+        color: Colors.white,
+      ),
+      duration: const Duration(seconds: 2),
+    );
   }
 }

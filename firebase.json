@@ -1,0 +1,33 @@
+{
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "fungibite-aplikasi",
+          "appId": "1:391055536764:android:01a0df94a80d089a7ecff9",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "fungibite-aplikasi",
+          "configurations": {
+            "android": "1:391055536764:android:01a0df94a80d089a7ecff9",
+            "ios": "1:391055536764:ios:ec9b24c1d3b4f0827ecff9",
+            "macos": "1:391055536764:ios:ec9b24c1d3b4f0827ecff9",
+            "web": "1:391055536764:web:aadb5e55cd1cf3d77ecff9",
+            "windows": "1:391055536764:web:851402b8d97f34427ecff9"
+          }
+        }
+      }
+    }
+  },
+  "hosting": {
+    "public": "build/web",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ]
+  }
+}
